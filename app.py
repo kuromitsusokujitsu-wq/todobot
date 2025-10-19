@@ -221,7 +221,7 @@ async def upload(file: UploadFile, title: str = Form(None),
 
         resp = openai.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.0,                     # ← ぶれを抑える
+            temperature=0.0,                     # ぶれを最小化
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": sys},
@@ -230,12 +230,30 @@ async def upload(file: UploadFile, title: str = Form(None),
         )
 
         content = resp.choices[0].message.content or "{}"
-        parsed = json.loads(content)  # まず素直に読み取る
+
+        # --- パース強化（3段ガード）---
+        parsed = None
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            # 1回目失敗 → コードフェンス/前後の文字を剥がして再挑戦
+            m = re.search(r"\{[\s\S]*\}", content)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    parsed = None
+
+        if parsed is None:
+            raise ValueError("JSON parse failed (raw head): " + content[:180])
+
+        # ラッパー欠落・キー揺れを補正
         machine_json, human_summary = coerce_llm_json(parsed, content)
 
     except Exception as e:
         payload, _ = err_json("parse failed", f"LLM出力の解析に失敗しました: {e}")
         return JSONResponse(status_code=500, content=payload)
+
 
 
     # 3) Slackへドラフト投稿
