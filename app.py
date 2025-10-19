@@ -213,47 +213,122 @@ async def upload(file: UploadFile, title: str = Form(None),
 
     transcript_text = getattr(tr, "text", "") or ""
 
-    # 2) LLM抽出（JSON固定応答）
+    # 2) LLM抽出（関数呼び出しで強制JSON）
     try:
         now_iso = datetime.datetime.now().astimezone().isoformat()
         sys = SYSTEM_PROMPT.format(NOW_ISO=now_iso)
         user_prompt = build_user_prompt(title, meeting_datetime_iso or now_iso, participants, transcript_text)
 
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "produce_minutes",
+                "description": "会議議事録のJSONと、人間向け要約を返す",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "machine_json": {
+                            "type": "object",
+                            "properties": {
+                                "meeting": {
+                                    "type": "object",
+                                    "properties": {
+                                        "title": {"type": "string"},
+                                        "datetime": {"type": "string"},
+                                        "participants": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"},
+                                                    "email": {"type": ["string","null"]}
+                                                },
+                                                "required": ["name"]
+                                            }
+                                        }
+                                    },
+                                    "required": ["title", "datetime"]
+                                },
+                                "summary": {
+                                    "type": "object",
+                                    "properties": {
+                                        "context": {"type": "string"},
+                                        "key_points": {"type": "array", "items": {"type": "string"}},
+                                        "decisions": {"type": "array", "items": {"type": "object",
+                                            "properties": {
+                                                "text": {"type": "string"},
+                                                "evidence_ts": {"type": ["string","null"]}
+                                            },
+                                            "required": ["text"]
+                                        }},
+                                        "risks": {"type": "array", "items": {"type": "string"}},
+                                        "parking_lot": {"type": "array", "items": {"type": "string"}}
+                                    },
+                                    "required": ["key_points"]
+                                },
+                                "actions": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "task": {"type": "string"},
+                                            "owner": {"type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"},
+                                                    "email": {"type": ["string","null"]}
+                                                },
+                                                "required": ["name"]
+                                            },
+                                            "due_date": {"type": ["string","null"]},
+                                            "priority": {"type": ["string","null"], "enum": ["low","medium","high", None]},
+                                            "evidence_ts": {"type": ["string","null"]},
+                                            "confidence": {"type": ["number","null"]},
+                                            "notes": {"type": ["string","null"]}
+                                        },
+                                        "required": ["task","owner"]
+                                    }
+                                },
+                                "next_meeting": {
+                                    "type": "object",
+                                    "properties": {
+                                        "suggested_datetime": {"type": ["string","null"]},
+                                        "suggested_agenda": {"type": "array", "items": {"type": "string"}}
+                                    }
+                                }
+                            },
+                            "required": ["summary","actions"]
+                        },
+                        "human_summary": {"type": "string"}
+                    },
+                    "required": ["machine_json","human_summary"]
+                }
+            }
+        }]
+
         resp = openai.chat.completions.create(
-            model="gpt-4o",
-            temperature=0.0,                     # ぶれを最小化
-            response_format={"type": "json_object"},
+            model="gpt-4o",            # 安定重視（miniでもOKだがまずは4o推奨）
+            temperature=0.0,
             messages=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": user_prompt}
-            ]
+            ],
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "produce_minutes"}}
         )
 
-        content = resp.choices[0].message.content or "{}"
+        choice = resp.choices[0]
+        tcalls = getattr(choice.message, "tool_calls", None)
+        if not tcalls or not tcalls[0].function or not tcalls[0].function.arguments:
+            raise ValueError("tool call missing")
 
-        # --- パース強化（3段ガード）---
-        parsed = None
-        try:
-            parsed = json.loads(content)
-        except Exception:
-            # 1回目失敗 → コードフェンス/前後の文字を剥がして再挑戦
-            m = re.search(r"\{[\s\S]*\}", content)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                except Exception:
-                    parsed = None
-
-        if parsed is None:
-            raise ValueError("JSON parse failed (raw head): " + content[:180])
-
-        # ラッパー欠落・キー揺れを補正
-        machine_json, human_summary = coerce_llm_json(parsed, content)
+        args_text = tcalls[0].function.arguments
+        parsed = json.loads(args_text)  # ← ここが“確実にJSON”
+        # ラッパー欠落などの揺れも一応吸収
+        machine_json, human_summary = coerce_llm_json(parsed, args_text)
 
     except Exception as e:
         payload, _ = err_json("parse failed", f"LLM出力の解析に失敗しました: {e}")
         return JSONResponse(status_code=500, content=payload)
-
 
 
     # 3) Slackへドラフト投稿
