@@ -84,6 +84,45 @@ SYSTEM_PROMPT = """
 }
 現在日時: {NOW_ISO}。
 """
+def coerce_llm_json(obj, raw_text: str = ""):
+    """
+    LLMの出力を {machine_json, human_summary} 形式に補正して返す。
+    想定外のキー名やラッパー欠落に耐える。
+    """
+    # 期待通り
+    if isinstance(obj, dict) and "machine_json" in obj and "human_summary" in obj:
+        return obj["machine_json"], obj["human_summary"]
+
+    # 大文字キーの揺れ
+    if isinstance(obj, dict) and "MACHINE_JSON" in obj and "HUMAN_SUMMARY" in obj:
+        return obj["MACHINE_JSON"], obj["HUMAN_SUMMARY"]
+
+    # ラッパーが無く、machine_json そのものが返ってきたケース
+    likely_keys = {"meeting", "summary", "actions", "next_meeting"}
+    if isinstance(obj, dict) and any(k in obj for k in likely_keys):
+        # 人間向け要約が無ければ、簡易要約を合成
+        ks = []
+        try:
+            ks = obj.get("summary", {}).get("key_points", []) or []
+        except Exception:
+            pass
+        hs = " / ".join(ks[:6]) if ks else "会議の要点を抽出しました。"
+        return obj, hs
+
+    # {"machine_json": {...}} だけ返るケース
+    if isinstance(obj, dict) and "machine_json" in obj:
+        return obj["machine_json"], obj.get("human_summary") or "会議サマリーを作成しました。"
+
+    # テキスト内に埋め込まれたJSONを救出（最初の { ... } を再パース）
+    try:
+        m = re.search(r"\{[\s\S]*\}", raw_text)
+        if m:
+            inner = json.loads(m.group(0))
+            return coerce_llm_json(inner)
+    except Exception:
+        pass
+
+    raise ValueError("missing keys in JSON response")
 
 def build_user_prompt(title, meeting_dt, participants, transcript_text):
     meta = f"""<MEETING_META>
@@ -182,22 +221,22 @@ async def upload(file: UploadFile, title: str = Form(None),
 
         resp = openai.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.2,
-            response_format={"type": "json_object"},  # ★ ここでJSONモードを強制
+            temperature=0.0,                     # ← ぶれを抑える
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": user_prompt}
             ]
         )
+
         content = resp.choices[0].message.content or "{}"
-        parsed = json.loads(content)  # {"machine_json": {...}, "human_summary": "..."}
-        if "machine_json" not in parsed or "human_summary" not in parsed:
-            raise ValueError("missing keys in JSON response")
-        machine_json = parsed["machine_json"]
-        human_summary = parsed["human_summary"]
+        parsed = json.loads(content)  # まず素直に読み取る
+        machine_json, human_summary = coerce_llm_json(parsed, content)
+
     except Exception as e:
         payload, _ = err_json("parse failed", f"LLM出力の解析に失敗しました: {e}")
         return JSONResponse(status_code=500, content=payload)
+
 
     # 3) Slackへドラフト投稿
     try:
