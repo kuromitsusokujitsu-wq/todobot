@@ -220,7 +220,7 @@ async def upload(file: UploadFile, title: str = Form(None),
         user_prompt = build_user_prompt(title, meeting_datetime_iso or now_iso, participants, transcript_text)
 
         resp = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.0,                     # ぶれを最小化
             response_format={"type": "json_object"},
             messages=[
