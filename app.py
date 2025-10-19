@@ -7,13 +7,13 @@ from slack_sdk.errors import SlackApiError
 from openai import OpenAI
 
 # ─────────────────────────────
-# ロガー設定
+# ロガー
 # ─────────────────────────────
 logger = logging.getLogger("app")
 logging.basicConfig(level=logging.INFO)
 
 # ─────────────────────────────
-# FastAPI / クライアント初期化
+# FastAPI / Clients
 # ─────────────────────────────
 app = FastAPI()
 openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -21,7 +21,7 @@ slack = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
 SLACK_CHANNEL = os.environ["SLACK_CHANNEL_ID"]
 
 # ─────────────────────────────
-# エラーハンドラ共通関数
+# 共通エラーJSON
 # ─────────────────────────────
 def err_json(message: str, detail: str = ""):
     cid = str(uuid.uuid4())
@@ -29,33 +29,60 @@ def err_json(message: str, detail: str = ""):
     logger.error(f"[{cid}] {message} :: {detail}")
     return payload, cid
 
-# ─────────────────────────────
-# 例外ハンドラ
-# ─────────────────────────────
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
     payload, _ = err_json("server failed", repr(exc))
     return JSONResponse(status_code=500, content=payload)
 
+from fastapi.exceptions import RequestValidationError
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     payload, _ = err_json("invalid request", exc.errors().__repr__())
     return JSONResponse(status_code=422, content=payload)
 
 # ─────────────────────────────
-# favicon対策
+# 小物（favicon）
 # ─────────────────────────────
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     return Response(content=b"", media_type="image/x-icon")
 
 # ─────────────────────────────
-# システムプロンプト
+# プロンプト（JSON固定）
 # ─────────────────────────────
-SYSTEM_PROMPT = """あなたは「会議議事録とアクション抽出」の専門家です。発話ログだけを根拠に、推測せず、
-1) 要約、2) 決定事項、3) ToDo（担当・期限YYYY-MM-DD・優先度・根拠タイムスタンプ）を返す。
-不確定表現（検討/かも等）はToDoに入れずparking_lotへ。出力は MACHINE_JSON と HUMAN_SUMMARY の二部構成。
-現在日時: {NOW_ISO}。会議日時は入力に含まれます。
+SYSTEM_PROMPT = """
+あなたは「会議議事録とアクション抽出」の専門家です。発話ログだけを根拠に、推測せず、
+1) 要約、2) 決定事項、3) ToDo（担当者・期限YYYY-MM-DD・優先度・根拠タイムスタンプ）、4) parking_lot を抽出します。
+日付は必ず正規化（例: 来週金曜 → YYYY-MM-DD）。不確定表現のものはToDoではなくparking_lotへ。
+返答は **次のJSONオブジェクト1個のみ** で返してください（文章やコードブロックは不要）:
+
+{
+  "machine_json": {
+    "meeting": { "title": string, "datetime": string, "participants": [{"name":string,"email":string|null}] },
+    "summary": {
+      "context": string,
+      "key_points": [string],
+      "decisions": [{"text":string,"evidence_ts":string|null}],
+      "risks": [string],
+      "parking_lot": [string]
+    },
+    "actions": [{
+      "task": string,
+      "owner": {"name": string, "email": string|null},
+      "due_date": string|null,
+      "priority": "low"|"medium"|"high"|null,
+      "evidence_ts": string|null,
+      "confidence": number|null,
+      "notes": string|null
+    }],
+    "next_meeting": {
+      "suggested_datetime": string|null,
+      "suggested_agenda": [string]
+    }
+  },
+  "human_summary": string
+}
+現在日時: {NOW_ISO}。
 """
 
 def build_user_prompt(title, meeting_dt, participants, transcript_text):
@@ -67,24 +94,13 @@ def build_user_prompt(title, meeting_dt, participants, transcript_text):
 """
     return meta + "\n<TRANSCRIPT>\n" + transcript_text + "\n</TRANSCRIPT>"
 
-def segments_to_transcript(segments):
-    lines = []
-    for seg in segments or []:
-        ss = int(seg.get("start", 0))
-        ts = str(datetime.timedelta(seconds=ss))
-        if len(ts) < 8: ts = "0" + ts
-        text = (seg.get("text") or "").strip()
-        if text:
-            lines.append(f"[{ts}] {text}")
-    return "\n".join(lines) if lines else ""
-
 # ─────────────────────────────
-# HTMLフロント
+# HTML（フロント）
 # ─────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><title>議事録ドラフトメーカー</title></head>
+<html lang="ja"><head><meta charset="utf-8"><title>会議録アップロード → Slackにドラフト通知</title></head>
 <body style="font-family:sans-serif;max-width:720px;margin:40px auto;line-height:1.6">
 <h1>会議録アップロード → Slackにドラフト通知</h1>
 <form id="f" method="post" action="/upload" enctype="multipart/form-data">
@@ -128,12 +144,13 @@ document.getElementById('f').addEventListener('submit', async (e)=>{
 </body></html>"""
 
 # ─────────────────────────────
-# メイン処理 /upload
+# メイン：/upload
 # ─────────────────────────────
 @app.post("/upload")
 async def upload(file: UploadFile, title: str = Form(None),
                  meeting_datetime_iso: str = Form(None),
                  participants: str = Form("[]")):
+
     # 入力チェック
     if not file or not file.filename:
         payload, _ = err_json("no file", "ファイルが添付されていません")
@@ -142,11 +159,10 @@ async def upload(file: UploadFile, title: str = Form(None),
         payload, _ = err_json("unsupported type", f"content_type={file.content_type}")
         return JSONResponse(status_code=415, content=payload)
 
-    # 1) 文字起こし
+    # 1) 音声→テキスト
     audio_bytes = await file.read()
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = file.filename or "upload"
-
     try:
         tr = openai.audio.transcriptions.create(
             model="gpt-4o-transcribe",
@@ -158,7 +174,7 @@ async def upload(file: UploadFile, title: str = Form(None),
 
     transcript_text = getattr(tr, "text", "") or ""
 
-    # 2) LLMで要約/ToDo抽出
+    # 2) LLM抽出（JSON固定応答）
     try:
         now_iso = datetime.datetime.now().astimezone().isoformat()
         sys = SYSTEM_PROMPT.format(NOW_ISO=now_iso)
@@ -167,23 +183,23 @@ async def upload(file: UploadFile, title: str = Form(None),
         resp = openai.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
+            response_format={"type": "json_object"},  # ★ ここでJSONモードを強制
             messages=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": user_prompt}
             ]
         )
-        content = resp.choices[0].message.content
-        m = re.search(r"MACHINE_JSON:\\s*([\\s\\S]*?)\\n\\nHUMAN_SUMMARY:\\s*([\\s\\S]*)$", content)
-        if not m:
-            payload, _ = err_json("parse failed", "LLM出力の解析に失敗しました")
-            return JSONResponse(status_code=500, content=payload)
-        machine_json = json.loads(m.group(1))
-        human_summary = m.group(2).strip()
+        content = resp.choices[0].message.content or "{}"
+        parsed = json.loads(content)  # {"machine_json": {...}, "human_summary": "..."}
+        if "machine_json" not in parsed or "human_summary" not in parsed:
+            raise ValueError("missing keys in JSON response")
+        machine_json = parsed["machine_json"]
+        human_summary = parsed["human_summary"]
     except Exception as e:
-        payload, _ = err_json("LLM failed", str(e))
+        payload, _ = err_json("parse failed", f"LLM出力の解析に失敗しました: {e}")
         return JSONResponse(status_code=500, content=payload)
 
-    # 3) Slackにドラフト投稿
+    # 3) Slackへドラフト投稿
     try:
         header = f"【議事録ドラフト】{title or '会議'}"
         blocks = [
@@ -203,7 +219,7 @@ async def upload(file: UploadFile, title: str = Form(None),
     return {"ok": True, "slack_ts": ts, "machine_json": machine_json, "human_summary": human_summary}
 
 # ─────────────────────────────
-# Slackボタン操作
+# Slackボタン
 # ─────────────────────────────
 @app.post("/slack/interact")
 async def slack_interact(req: Request):
