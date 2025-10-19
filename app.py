@@ -213,7 +213,7 @@ async def upload(file: UploadFile, title: str = Form(None),
 
     transcript_text = getattr(tr, "text", "") or ""
 
-    # 2) LLM抽出（関数呼び出しで強制JSON）
+    # 2) LLM抽出（まずは tool call、無ければJSON本文の3段パース）
     try:
         now_iso = datetime.datetime.now().astimezone().isoformat()
         sys = SYSTEM_PROMPT.format(NOW_ISO=now_iso)
@@ -227,77 +227,7 @@ async def upload(file: UploadFile, title: str = Form(None),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "machine_json": {
-                            "type": "object",
-                            "properties": {
-                                "meeting": {
-                                    "type": "object",
-                                    "properties": {
-                                        "title": {"type": "string"},
-                                        "datetime": {"type": "string"},
-                                        "participants": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "name": {"type": "string"},
-                                                    "email": {"type": ["string","null"]}
-                                                },
-                                                "required": ["name"]
-                                            }
-                                        }
-                                    },
-                                    "required": ["title", "datetime"]
-                                },
-                                "summary": {
-                                    "type": "object",
-                                    "properties": {
-                                        "context": {"type": "string"},
-                                        "key_points": {"type": "array", "items": {"type": "string"}},
-                                        "decisions": {"type": "array", "items": {"type": "object",
-                                            "properties": {
-                                                "text": {"type": "string"},
-                                                "evidence_ts": {"type": ["string","null"]}
-                                            },
-                                            "required": ["text"]
-                                        }},
-                                        "risks": {"type": "array", "items": {"type": "string"}},
-                                        "parking_lot": {"type": "array", "items": {"type": "string"}}
-                                    },
-                                    "required": ["key_points"]
-                                },
-                                "actions": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "task": {"type": "string"},
-                                            "owner": {"type": "object",
-                                                "properties": {
-                                                    "name": {"type": "string"},
-                                                    "email": {"type": ["string","null"]}
-                                                },
-                                                "required": ["name"]
-                                            },
-                                            "due_date": {"type": ["string","null"]},
-                                            "priority": {"type": ["string","null"], "enum": ["low","medium","high", None]},
-                                            "evidence_ts": {"type": ["string","null"]},
-                                            "confidence": {"type": ["number","null"]},
-                                            "notes": {"type": ["string","null"]}
-                                        },
-                                        "required": ["task","owner"]
-                                    }
-                                },
-                                "next_meeting": {
-                                    "type": "object",
-                                    "properties": {
-                                        "suggested_datetime": {"type": ["string","null"]},
-                                        "suggested_agenda": {"type": "array", "items": {"type": "string"}}
-                                    }
-                                }
-                            },
-                            "required": ["summary","actions"]
-                        },
+                        "machine_json": {"type": "object"},
                         "human_summary": {"type": "string"}
                     },
                     "required": ["machine_json","human_summary"]
@@ -306,7 +236,7 @@ async def upload(file: UploadFile, title: str = Form(None),
         }]
 
         resp = openai.chat.completions.create(
-            model="gpt-4o",            # 安定重視（miniでもOKだがまずは4o推奨）
+            model="gpt-4o",          # 安定重視（miniに戻してもOK）
             temperature=0.0,
             messages=[
                 {"role": "system", "content": sys},
@@ -316,20 +246,48 @@ async def upload(file: UploadFile, title: str = Form(None),
             tool_choice={"type": "function", "function": {"name": "produce_minutes"}}
         )
 
-        choice = resp.choices[0]
-        tcalls = getattr(choice.message, "tool_calls", None)
-        if not tcalls or not tcalls[0].function or not tcalls[0].function.arguments:
-            raise ValueError("tool call missing")
+        machine_json = None
+        human_summary = None
 
-        args_text = tcalls[0].function.arguments
-        parsed = json.loads(args_text)  # ← ここが“確実にJSON”
-        # ラッパー欠落などの揺れも一応吸収
-        machine_json, human_summary = coerce_llm_json(parsed, args_text)
+        # --- ① tool_calls から取得（最優先） ---
+        try:
+            tcalls = resp.choices[0].message.tool_calls
+            if tcalls and tcalls[0].function and tcalls[0].function.arguments:
+                args_text = tcalls[0].function.arguments
+                # デバッグログ（先頭だけ）
+                logger.info("tool args head: %s", args_text[:180].replace("\n"," "))
+                parsed = json.loads(args_text)
+                machine_json, human_summary = coerce_llm_json(parsed, args_text)
+        except Exception as _e:
+            logger.warning("tool call parse fallback: %s", repr(_e))
+
+        # --- ② tool_calls が無い/失敗 → 本文JSONを3段ガードで取得 ---
+        if machine_json is None or human_summary is None:
+            content = resp.choices[0].message.content or ""
+            logger.info("content head: %s", content[:180].replace("\n"," "))
+            parsed = None
+            # 2-1 素直に
+            try:
+                if content.strip():
+                    parsed = json.loads(content)
+            except Exception:
+                parsed = None
+            # 2-2 コードフェンス/前後の文字を剥がす
+            if parsed is None:
+                m = re.search(r"\{[\s\S]*\}", content)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(0))
+                    except Exception:
+                        parsed = None
+            if parsed is None:
+                raise ValueError("JSON parse failed (raw head): " + content[:180])
+            machine_json, human_summary = coerce_llm_json(parsed, content)
 
     except Exception as e:
+        # 生ログをもう少し出す
         payload, _ = err_json("parse failed", f"LLM出力の解析に失敗しました: {e}")
         return JSONResponse(status_code=500, content=payload)
-
 
     # 3) Slackへドラフト投稿
     try:
